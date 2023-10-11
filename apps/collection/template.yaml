@@ -129,6 +129,7 @@ Resources:
     UpdateReplacePolicy: Retain
     DependsOn: TopicPolicy
     Properties:
+      BucketName: !If [ EmptySourceBucketNames, "observe-default-collection-bucket", !Select [ 0, !Ref SourceBucketNames ]]
       LifecycleConfiguration:
         Rules:
           - ExpirationInDays: 1
@@ -148,20 +149,16 @@ Resources:
         DestinationUri: !Ref DestinationUri
         SourceBucketNames: !If
           - EmptySourceBucketNames
-          - [!Ref Bucket]
-          - !Split
-            - ","
-            - !Sub
-              - "${Bucket},${buckets}"
-              - buckets: !Join [",", !Ref SourceBucketNames]
+          - !Ref Bucket
+          - !Sub
+            - "${Bucket},${buckets}"
+            - buckets: !Join [",", !Ref SourceBucketNames]
         SourceTopicArns: !If
           - EmptySourceTopicArns
-          - [!Ref Topic]
-          - !Split
-            - ","
-            - !Sub
-              - "${Topic},${topics}"
-              - topics: !Join [",", !Ref SourceTopicArns]
+          - !Ref Topic
+          - !Sub
+            - "${Topic},${topics}"
+            - topics: !Join [",", !Ref SourceTopicArns]
         NameOverride: !If
           - UseStackName
           - !Ref 'AWS::StackName'
