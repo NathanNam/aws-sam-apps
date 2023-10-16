@@ -1,0 +1,84 @@
+#!/bin/bash
+
+
+# Ensure the AWS CLI is authenticated
+aws sts get-caller-identity
+
+# package
+## setup package pre-requisites
+## create the package
+
+export SAM_BUCKET="${USER}-${AWS_REGION}"
+export AWS_REGION=us-east-1
+export APP=forwarder
+
+aws s3api create-bucket --bucket "$SAM_BUCKET" --region ${AWS_REGION}
+aws s3api put-public-access-block \
+--bucket "$SAM_BUCKET" \
+--public-access-block-configuration "BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false"
+aws s3api delete-bucket-ownership-controls --bucket ${SAM_BUCKET}
+
+make sam-package
+
+# setup test infra
+## source bucket
+## destination bucket
+## deploy
+
+export SOURCE_BUCKET=${USER}-source-bucket
+export DESTINATION_BUCKET=${USER}-destination-bucket
+export ACCESS_POINT_NAME="${USER}-destination-access-point"
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+# Create source bucket
+aws s3api create-bucket --bucket ${SOURCE_BUCKET} --region ${AWS_REGION}
+# Create destination bucket
+aws s3api create-bucket --bucket ${DESTINATION_BUCKET} --region ${AWS_REGION}
+# Create Access Point for the destination bucket
+export DATA_ACCESS_POINT_ARN=$(aws s3control create-access-point --account-id $AWS_ACCOUNT_ID --bucket $DESTINATION_BUCKET --name $ACCESS_POINT_NAME --region $AWS_REGION | jq -r '.AccessPointArn')
+
+sam deploy \
+  --template-file "$PWD/apps/$APP/.aws-sam/build/$AWS_REGION/packaged.yaml" \
+  --stack-name "$USER-collection" \
+  --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+  --region $AWS_REGION \
+  --parameter-overrides SourceBucketNames="$SOURCE_BUCKET" DestinationUri="s3://$DESTINATION_BUCKET/" DataAccessPointArn="$DATA_ACCESS_POINT_ARN" InstallConfig="false"
+
+
+# do the test
+## setup event bridge on the bucket
+## drop fixture data into source bucket
+## assert / verify
+
+
+
+# Debugging
+
+aws events list-rules
+export RULE_NAME=$(aws events list-rules --query "Rules[?Description=='Trigger copy for object created events'].Name | [0]" --output text)
+
+aws events describe-rule --name $RULE_NAME
+aws cloudwatch list-metrics --namespace "AWS/Events" --metric-name "MatchedEvents" --dimensions Name=RuleName,Value=$RULE_NAME
+
+export SOURCE_BUCKET_ARN="arn:aws:s3:::$SOURCE_BUCKET"
+
+
+
+
+# Cleaning Up
+# Delete SAM Stack
+sam delete --stack-name "$USER-$APP" --region $AWS_REGION
+
+# Delete the Access Point
+aws s3control delete-access-point --name $ACCESS_POINT_NAME --account-id $AWS_ACCOUNT_ID --region $AWS_REGION
+
+# Empty and delete the S3 buckets
+# Note: You may want to ensure that these buckets are empty before deleting them, otherwise the deletion will fail.
+aws s3 rm s3://${SOURCE_BUCKET} --recursive
+aws s3api delete-bucket --bucket ${SOURCE_BUCKET} --region ${AWS_REGION}
+
+aws s3 rm s3://${DESTINATION_BUCKET} --recursive
+aws s3api delete-bucket --bucket ${DESTINATION_BUCKET} --region ${AWS_REGION}
+
+aws s3 rm s3://${SAM_BUCKET} --recursive
+aws s3api delete-bucket --bucket ${SAM_BUCKET} --region ${AWS_REGION}

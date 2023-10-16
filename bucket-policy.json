@@ -1,0 +1,18 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AddPerm",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::colin-testing/*",
+            "Condition": {
+                "IpAddress": {
+                    "aws:SourceIp": "97.107.56.27"
+                }
+            }
+        }
+    ]
+ }
+ 
