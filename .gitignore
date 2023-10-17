@@ -10,3 +10,5 @@ terraform.tfvars
 tfplan
 
 .terraform.lock.hcl
+
+event_from_destination.json

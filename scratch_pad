@@ -8,16 +8,8 @@ aws sts get-caller-identity
 ## setup package pre-requisites
 ## create the package
 
-export SAM_BUCKET="${USER}-${AWS_REGION}"
 export AWS_REGION=us-east-1
 export APP=forwarder
-
-aws s3api create-bucket --bucket "$SAM_BUCKET" --region ${AWS_REGION}
-aws s3api put-public-access-block \
---bucket "$SAM_BUCKET" \
---public-access-block-configuration "BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false"
-aws s3api delete-bucket-ownership-controls --bucket ${SAM_BUCKET}
-
 make sam-package
 
 # setup test infra
@@ -34,51 +26,157 @@ export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output tex
 aws s3api create-bucket --bucket ${SOURCE_BUCKET} --region ${AWS_REGION}
 # Create destination bucket
 aws s3api create-bucket --bucket ${DESTINATION_BUCKET} --region ${AWS_REGION}
-# Create Access Point for the destination bucket
+# Attempt to delete the existing access point, and proceed regardless of success
+aws s3control delete-access-point --account-id $AWS_ACCOUNT_ID --name $ACCESS_POINT_NAME --region $AWS_REGION || true
+
+# Now, create the access point
 export DATA_ACCESS_POINT_ARN=$(aws s3control create-access-point --account-id $AWS_ACCOUNT_ID --bucket $DESTINATION_BUCKET --name $ACCESS_POINT_NAME --region $AWS_REGION | jq -r '.AccessPointArn')
 
 sam deploy \
   --template-file "$PWD/apps/$APP/.aws-sam/build/$AWS_REGION/packaged.yaml" \
-  --stack-name "$USER-collection" \
+  --stack-name "$USER-$APP" \
   --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
   --region $AWS_REGION \
   --parameter-overrides SourceBucketNames="$SOURCE_BUCKET" DestinationUri="s3://$DESTINATION_BUCKET/" DataAccessPointArn="$DATA_ACCESS_POINT_ARN" InstallConfig="false"
 
+QUEUE_URL=$(aws sqs get-queue-url --queue-name "$USER-$APP" --region $AWS_REGION | jq -r '.QueueUrl')
+QUEUE_ARN=$(aws sqs get-queue-attributes --queue-url $QUEUE_URL --attribute-names QueueArn --region $AWS_REGION | jq -r '.Attributes.QueueArn')
 
-# do the test
-## setup event bridge on the bucket
-## drop fixture data into source bucket
-## assert / verify
+aws s3api put-bucket-notification-configuration --bucket $SOURCE_BUCKET --notification-configuration '{
+    "QueueConfigurations": [
+        {
+            "QueueArn": "'$QUEUE_ARN'",
+            "Events": ["s3:ObjectCreated:*"]
+        }
+    ]
+}' --region $AWS_REGION
+
+# Setup the S3 bucket to notify the Lambda function
+export FUNCTION_NAME=$(aws cloudformation describe-stacks --stack-name "$USER-$APP" --query "Stacks[0].Outputs[?OutputKey=='Function'].OutputValue" --region $AWS_REGION --output text)
+# Extracting function name from the ARN
+export FUNCTION_NAME_SIMPLE=$(echo $FUNCTION_NAME | awk -F':' '{print $NF}')
+export ROLE_ARN=$(aws lambda get-function-configuration --region ${AWS_REGION} --function-name ${FUNCTION_NAME} --query 'Role' --output text)
+export ROLE_NAME=$(echo $ROLE_ARN | awk -F/ '{print $NF}')
+
+# Allow Lambda function to CopyObject and PutObject to source and destination buckets
+aws iam put-role-policy --role-name $ROLE_NAME --policy-name S3AccessPolicy --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": ["s3:CopyObject", "s3:PutObject"],
+            "Resource": ["arn:aws:s3:::'$SOURCE_BUCKET'/*", "arn:aws:s3:::'$DESTINATION_BUCKET'/*"]
+        }
+    ]
+}'
+
+# Grant Lambda role permission on the source bucket
+aws s3api put-bucket-policy --bucket $SOURCE_BUCKET --policy '{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "'$ROLE_ARN'"
+            },
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::'$SOURCE_BUCKET'/*"
+        }
+    ]
+}'
+
+# Grant Lambda role permission on the destination bucket
+aws s3api put-bucket-policy --bucket $DESTINATION_BUCKET --policy '{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "'$ROLE_ARN'"
+            },
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::'$DESTINATION_BUCKET'/*"
+        }
+    ]
+}'
+
+aws s3 cp apps/forwarder/events/event.json s3://${SOURCE_BUCKET}/
+
+# # Setup the S3 bucket to notify the Lambda function
+# export FUNCTION_NAME=$(aws cloudformation describe-stacks --stack-name "$USER-$APP" --query "Stacks[0].Outputs[?OutputKey=='Function'].OutputValue" --region $AWS_REGION --output text)
+# # Extracting function name from the ARN
+# export FUNCTION_NAME_SIMPLE=$(echo $FUNCTION_NAME | awk -F':' '{print $NF}')
+# export ROLE_ARN=$(aws lambda get-function-configuration --region ${AWS_REGION} --function-name ${FUNCTION_NAME} --query 'Role' --output text)
+# export ROLE_NAME=$(echo $ROLE_ARN | awk -F/ '{print $NF}')
+
+# aws s3api put-bucket-notification-configuration \
+#     --bucket ${SOURCE_BUCKET} \
+#     --notification-configuration '{
+#         "LambdaFunctionConfigurations": [
+#             {
+#                 "LambdaFunctionArn": "'${FUNCTION_NAME}'",
+#                 "Events": ["s3:ObjectCreated:*"]
+#             }
+#         ]
+#     }'
+
+# aws lambda add-permission \
+#     --function-name ${FUNCTION_NAME_SIMPLE} \
+#     --action "lambda:InvokeFunction" \
+#     --principal s3.amazonaws.com \
+#     --source-arn arn:aws:s3:::${SOURCE_BUCKET} \
+#     --statement-id s3invoke
+
+# # Assuming you want to grant full S3 and CloudWatch Logs permissions for debugging (not recommended for production):
+# aws iam put-role-policy --role-name ${ROLE_NAME} --policy-name S3CloudWatchFullAccess --policy-document '{
+#   "Version": "2012-10-17",
+#   "Statement": [
+#     {
+#       "Effect": "Allow",
+#       "Action": ["s3:*", "logs:*"],
+#       "Resource": "*"
+#     }
+#   ]
+# }'
+
+# aws s3 cp test.json s3://${SOURCE_BUCKET}/
 
 
 
 # Debugging
 
-aws events list-rules
-export RULE_NAME=$(aws events list-rules --query "Rules[?Description=='Trigger copy for object created events'].Name | [0]" --output text)
+# Now use this simple name to fetch logs
+export LOG_STREAM_NAME=$(aws logs describe-log-streams --region ${AWS_REGION} --log-group-name /aws/lambda/${FUNCTION_NAME_SIMPLE} --order-by LastEventTime --descending | jq -r '.logStreams[0].logStreamName')
 
-aws events describe-rule --name $RULE_NAME
-aws cloudwatch list-metrics --namespace "AWS/Events" --metric-name "MatchedEvents" --dimensions Name=RuleName,Value=$RULE_NAME
+aws logs get-log-events --region ${AWS_REGION} --log-group-name /aws/lambda/${FUNCTION_NAME_SIMPLE} --log-stream-name ${LOG_STREAM_NAME}
 
-export SOURCE_BUCKET_ARN="arn:aws:s3:::$SOURCE_BUCKET"
+aws iam get-role --role-name ${ROLE_NAME}
 
+aws iam list-attached-role-policies --role-name ${ROLE_NAME}
+aws iam list-role-policies --role-name ${ROLE_NAME}
 
+aws s3api get-bucket-notification-configuration --bucket ${SOURCE_BUCKET}
+
+export DLQ_ARN=$(aws lambda get-function-configuration --region ${AWS_REGION} --function-name ${FUNCTION_NAME} --query 'DeadLetterConfig.TargetArn' --output text)
+
+aws lambda get-policy --region ${AWS_REGION} --function-name ${FUNCTION_NAME_SIMPLE} --query 'Policy' --output text | jq
+
+aws lambda invoke --region ${AWS_REGION} --function-name ${FUNCTION_NAME} --payload '{ "some": "sample-payload" }' output.txt
 
 
 # Cleaning Up
-# Delete SAM Stack
+
+aws events remove-targets --rule ${EVENT_RULE_NAME} --ids "1"
+aws events delete-rule --name ${EVENT_RULE_NAME}
+
+aws lambda remove-permission --region ${AWS_REGION} --function-name ${FUNCTION_NAME} --statement-id "${EVENT_RULE_NAME}-Event"
+
 sam delete --stack-name "$USER-$APP" --region $AWS_REGION
 
-# Delete the Access Point
-aws s3control delete-access-point --name $ACCESS_POINT_NAME --account-id $AWS_ACCOUNT_ID --region $AWS_REGION
+aws s3control delete-access-point --region $AWS_REGION --account-id $AWS_ACCOUNT_ID --name $ACCESS_POINT_NAME
 
-# Empty and delete the S3 buckets
-# Note: You may want to ensure that these buckets are empty before deleting them, otherwise the deletion will fail.
 aws s3 rm s3://${SOURCE_BUCKET} --recursive
-aws s3api delete-bucket --bucket ${SOURCE_BUCKET} --region ${AWS_REGION}
-
 aws s3 rm s3://${DESTINATION_BUCKET} --recursive
-aws s3api delete-bucket --bucket ${DESTINATION_BUCKET} --region ${AWS_REGION}
+aws s3api delete-bucket --bucket ${SOURCE_BUCKET}
+aws s3api delete-bucket --bucket ${DESTINATION_BUCKET}
 
-aws s3 rm s3://${SAM_BUCKET} --recursive
-aws s3api delete-bucket --bucket ${SAM_BUCKET} --region ${AWS_REGION}
