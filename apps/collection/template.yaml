@@ -24,7 +24,8 @@ Metadata:
       - Label:
           default: Resources
         Parameters:
-          - InstallConfig
+          - IncludeResourceTypes
+          - ExcludeResourceTypes
       - Label:
           default: Logs
         Parameters:
@@ -72,17 +73,19 @@ Parameters:
       Name of IAM role expected by Filedrop. This role will be created as part
       of this stack, and must therefore be unique within the account.
     Default: ""
-  InstallConfig:
-    Type: String
-    AllowedValues:
-      - "true"
-      - "false"
-    Default: "true"
+  IncludeResourceTypes:
+    Type: CommaDelimitedList
     Description: >-
-      Set to `true` to install AWS Config. AWS Config can only be configured
-      once per region. If you already have an existing AWS Config Recorder
-      installed, set this value to `false` and subscribe the S3 bucket
-      containing the configuration snapshots.
+      Set of resource types to collect using AWS Config. Leave this parameter
+      unset if you already have AWS Config installed in this region.
+      This parameter supports the wildcard `*` to collect all resource types.
+    Default: ""
+  ExcludeResourceTypes:
+    Type: CommaDelimitedList
+    Description: >-
+      Exclude a subset of resource types from configuration collection.
+      Requires `IncludeResourceTypes` to be set to `*`.
+    Default: ""
   LogGroupNamePatterns:
     Type: CommaDelimitedList
     Description: >-
@@ -98,9 +101,13 @@ Parameters:
     Default: ''
 
 Conditions:
-  EnableConfig: !Equals
-    - !Ref InstallConfig
-    - "true"
+  EnableConfig: !Not
+    - !Equals
+      - ""
+      - !Join [",", !Ref IncludeResourceTypes]
+  IncludeAllResourceTypes: !Equals
+    - "*"
+    - !Join [",", !Ref IncludeResourceTypes]
   EnableSubscriber: !Not
     - !And
       - !Equals
@@ -224,6 +231,15 @@ Resources:
       Parameters:
         BucketName: !Ref Bucket
         TopicARN: !Ref Topic
+        IncludeResourceTypes: !If
+          - IncludeAllResourceTypes
+          - ""
+          - !Join
+            - ","
+            - !Ref IncludeResourceTypes
+        ExcludeResourceTypes: !Join
+          - ","
+          - !Ref ExcludeResourceTypes
   Firehose:
     Type: AWS::Serverless::Application
     Properties:
